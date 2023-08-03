@@ -1,0 +1,248 @@
+input_number:
+  tesla_massima_corrente_ricarica:
+    name: Tesla Massima Corrente Ricarica
+    min: 5
+    max: 32
+    step: 1
+    mode: box
+  tesla_potenza_massima_contatore:
+    name: Tesla Potenza Massima Contatore
+    min: 1
+    max: 10000
+    step: 1
+    mode: box
+  tesla_potenza_massima_contatore_33:
+    name: Tesla Potenza Massima Contatore 33%
+    min: 1
+    max: 14000
+    step: 1
+    mode: box
+
+input_boolean:
+  tesla_abilitazione_gestione_ricarica:
+    name: "Tesla Abilitazione Gestione Ricarica"
+
+template:
+  - binary_sensor:
+      - name: "Tesla Potenza Raggiunto Limite"
+        state: "{{ (states('sensor.tesla_timer_33') | int(0)) > 7200 }}"
+      - name: "Tesla Potenza Distacco Immediato"
+        state: "{{ states('sensor.consumo_energetico_contatore')|int(1) > states('input_number.tesla_potenza_massima_contatore')|int(1) and states('sensor.consumo_energetico_contatore')|int(1) > states('input_number.tesla_potenza_massima_contatore_33')|int(1)}}"
+        delay_off:
+          seconds: 30
+      - name: Malfunzionamento Gestione Carichi
+        state: >
+          {{ is_state('sensor.confacar_battery', 'unavailable')
+            or is_state('sensor.consumo_energetico_wallbox', 'unavailable')
+            or is_state('sensor.produzione_energia_fotovoltaica', 'unavailable')
+            or is_state('sensor.consumo_energetico_taverna', 'unavailable')
+            or is_state('sensor.consumo_energetico_p1', 'unavailable')
+            or is_state('sensor.consumo_energetico_rack', 'unavailable')
+            or is_state('sensor.consumo_energetico_scrivania_andrea', 'unavailable') 
+            or is_state('sensor.consumo_energetico_contatore', 'unavailable') 
+            or is_state('sensor.consumo_totale', 'unavailable')
+            or is_state('binary_sensor.tesla_wall_connector_contactor_closed', 'unavailable') }}
+        delay_on:
+          seconds: 10
+
+sensor:
+  - platform: template
+    sensors:
+      tesla_ampere_disponibili:
+        friendly_name: "Tesla Ampere Disponibili"
+        unit_of_measurement: "A"
+        value_template: "{{ (((states.input_number.tesla_potenza_massima_contatore.state | round(1) + states.sensor.produzione_energia_fotovoltaica.state | round(1) - (states.sensor.consumo_totale.state | round(1) )) / (states.sensor.tensione_rete_contatore_wallbox.state | round(1)))) | round(1)}}"
+        icon_template: mdi:home-lightning-bolt
+
+variable:
+  tesla_timer_33:
+    value: 0
+    restore: true
+    name: "Tesla Soglia Consumo 33%"
+
+automation:
+  - id: "Tesla_Timer_Utilizzo_Potenza_33"
+    alias: "Tesla Timer Utilizzo Potenza 33%"
+    trigger:
+      - platform: time_pattern
+        seconds: /1
+    action:
+      choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ states('sensor.consumo_energetico_contatore') | int(0) > states('input_number.tesla_potenza_massima_contatore') | int(0) }}"
+          sequence:
+            - service: variable.update_sensor
+              data:
+                value: "{{ states('sensor.tesla_timer_33') | int(0) + 1 }}"
+              target:
+                entity_id: "sensor.tesla_timer_33"
+
+  - id: "Tesla_Reset_Timer_Utilizzo_Potenza_33"
+    alias: "Tesla Reset Timer Utilizzo Potenza 33%"
+    trigger:
+      - platform: time
+        at: "00:01:00"
+    action:
+      - service: variable.update_sensor
+        data:
+          value: "0"
+        target:
+          entity_id: "sensor.tesla_timer_33"
+
+  - id: "Tesla_Comando_Wallbox"
+    alias: "Tesla Comando WallBox"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.tesla_potenza_raggiunto_limite
+        to: "on"
+      - platform: state
+        entity_id: binary_sensor.tesla_potenza_distacco_immediato
+        to: "on"
+      - platform: time_pattern
+        minutes: /5
+      - platform: state
+        entity_id: input_number.tesla_massima_corrente_ricarica
+      - platform: state
+        entity_id: binary_sensor.malfunzionamento_gestione_carichi
+        to: "off"
+    condition:
+      #GESTIONE ABILITATA
+      - condition: state
+        entity_id: input_boolean.tesla_abilitazione_gestione_ricarica
+        state: "on"
+        #AUTO A CASA
+      - condition: state
+        entity_id: device_tracker.confacar_location_tracker
+        state: "home"
+        #AUTO CON SPINA COLLEGATA
+      - condition: state
+        entity_id: binary_sensor.confacar_charger
+        state: "on"
+        #AUTO COLLEGATA A WALLBOX
+      - condition: state
+        entity_id: binary_sensor.tesla_wall_connector_vehicle_connected
+        state: "on"
+        #NESSUN MALFUNZIONAMENTO GESTIONE CARICHI
+      - condition: state
+        entity_id: binary_sensor.malfunzionamento_gestione_carichi
+        state: "off"
+        #SE LA BATTERIA NON HA RAGGIUNTO IL TARGET (BATTERIA IN CARICA)
+      - not:
+          - condition: state
+            entity_id: sensor.confacar_time_charge_complete
+            state: "unknown"
+    action:
+      - choose:
+          #SE ATTUALMENTE STO SFORANDO IL LIMITE MASSIMO E LA CORRENTE DISPONIBILE SAREBBE PIU DI 5 AMPERE FERMANDO LA RICARICA, RIDUCO LA RICARICA
+          - conditions:
+              - condition: template
+                value_template: "{{ states.sensor.confacar_battery.state < states.number.confacar_charge_limit.state }}"
+            sequence:
+              - choose:
+                  #SE MAGGIORE DEL MINIMO E MINORE DEL MASSIMO
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ (states.input_number.tesla_potenza_massima_contatore.state | int(0) + states.sensor.produzione_energia_fotovoltaica.state | int(0) - (states.sensor.consumo_totale.state | int(0) - states.sensor.consumo_energetico_wallbox.state | int(0))) / 230 >= 5.05 }}"
+                      - condition: template
+                        value_template: "{{ ((states.input_number.tesla_potenza_massima_contatore.state | int(0) + states.sensor.produzione_energia_fotovoltaica.state | int(0) - ( states.sensor.consumo_totale.state | int(0) - states.sensor.consumo_energetico_wallbox.state | int(0))) / 230 ) | int(0) < states.input_number.tesla_massima_corrente_ricarica.state | int(0) }}"
+                    sequence:
+                        # ACCENDO RICARICA (ANCHE SE PROBABILMENTE E' GIA' ATTIVA)
+                      - service: switch.turn_on
+                        target:
+                          entity_id: switch.confacar_charger
+                        # IMPOSTO TARGET DI POTENZA RICARICA
+                      - service: number.set_value
+                        target:
+                          entity_id: number.confacar_charging_amps
+                        data:
+                          value: "{{ (((states.input_number.tesla_potenza_massima_contatore.state | int(0) + states.sensor.produzione_energia_fotovoltaica.state | int(0) - (states.sensor.consumo_totale.state | int(0) - states.sensor.consumo_energetico_wallbox.state | int(0) )) / 230)  ) | int(1)}}"
+                    #SE MAGGIORE DEL MINIMO E MAGGIORE DEL MASSIMO
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ (states.input_number.tesla_potenza_massima_contatore.state | int(0) + states.sensor.produzione_energia_fotovoltaica.state | int(0) - ( states.sensor.consumo_totale.state | int(0) - states.sensor.consumo_energetico_wallbox.state | int(0))) > 1300}}"
+                      - condition: template
+                        value_template: "{{states.input_number.tesla_potenza_massima_contatore.state | int(0) + states.sensor.produzione_energia_fotovoltaica.state | int(0) - (states.sensor.consumo_totale.state | int(0) - states.sensor.consumo_energetico_wallbox.state | int(0) ) > (states.input_number.tesla_massima_corrente_ricarica.state | int(0) * 230 )}}"
+                    sequence:
+                        # ACCENDO RICARICA (ANCHE SE PROBABILMENTE E' GIA' ATTIVA)
+                      - service: switch.turn_on
+                        target:
+                          entity_id: switch.confacar_charger
+                        # IMPOSTO TARGET DI POTENZA RICARICA AL TETTO MASSIMO SCELTO
+                      - service: number.set_value
+                        target:
+                          entity_id: number.confacar_charging_amps
+                        data:
+                          value: "{{states.input_number.tesla_massima_corrente_ricarica.state}}"
+        #SE HO SFORATO IL MASSIMO CONSENTITO E ANCHE ANCHE ALLA MINIMA CORRENTE DI RICARICA SFOREREI (A MENO DI 5A NON SI PUO CARICARE), SPENGO LA RICARICA
+      - choose:
+          - conditions:
+              #SE NON E' DISPONIBILE LA POTENZA MINIMA DI AGGANCIO (5 AMPERE)
+              - condition: template
+                value_template: "{{ (states.input_number.tesla_potenza_massima_contatore.state | int(0) + states.sensor.produzione_energia_fotovoltaica.state | int(0) - (states.sensor.consumo_totale.state | int(0) - states.sensor.consumo_energetico_wallbox.state | int(0))) / 230 < 5.05 }}"
+              #SE LA RICARICA E' ATTUALMENTE ATTIVA
+              - condition: state
+                entity_id: switch.confacar_charger
+                state: "on"
+            sequence:
+                # FERMO LA RICARICA
+              - service: switch.turn_off
+                target:
+                  entity_id: switch.confacar_charger
+                # RIPRISTINO CORRENTE DI RICARICA AL MINIMO
+              - service: number.set_value
+                target:
+                  entity_id: number.confacar_charging_amps
+                data:
+                  value: "5"
+                # INVIO NOTIFICA
+              - service: notify.mobile_app_iphone_di_andrea
+                data_template:
+                  title: Gestione Carichi Tesla
+                  message: Ricarica Tesla interrotta causa superamento budget potenza disponibile.
+
+  #REFRESH INTEGRAZIONE CLOUD TESLA QUANDO NECESSARIA PER GESTIONE RICARICA
+  - id: "Tesla_Refresh_Integrazione"
+    alias: "Tesla Refresh Integrazione Veicolo"
+    description: "Forza l'integrazione a svegliare l'auto per ricevere i dati o per ripristinare la connessione"
+    trigger:
+      - platform: state
+        entity_id: person.tesla
+        to: "home"
+      - platform: state
+        entity_id: binary_sensor.tesla_wall_connector_vehicle_connected
+        to: "on"
+      - platform: state
+        entity_id: binary_sensor.tesla_potenza_raggiunto_limite
+        to: "off"
+      - platform: state
+        entity_id: binary_sensor.tesla_potenza_distacco_immediato
+        to: "off"
+      - platform: numeric_state
+        entity_id: sensor.consumo_energetico_wallbox
+        above: 200
+        for:
+          seconds: 10
+    action:
+      - service: button.press
+        target:
+          entity_id: button.confacar_force_data_update
+
+  #SE VIENE RILEVATO MALFUNZIONAMENTO, INVIO NOTIFICA E DIMINUISCO CORRENTE DI RICARICA PER EVITARE DISTACCHI
+  - id: "Gestione_Carichi_Malfunzionamento"
+    alias: "Gestione Carichi Malfunzionamento"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.malfunzionamento_gestione_carichi
+        to: "on"
+    action:
+      - service: number.set_value
+        target:
+          entity_id: number.confacar_charging_amps
+        data:
+          value: "5"
+      - service: notify.mobile_app_iphone_di_andrea
+        data_template:
+          title: Gestione Carichi Tesla
+          message: Gestione Carichi - Malfunzionamento Entità
